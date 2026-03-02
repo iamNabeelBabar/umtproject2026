@@ -1,180 +1,223 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Any
-import json
-
+from typing import List, Dict, Any
 from langchain_openai import ChatOpenAI
-from langchain.tools import tool
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import tool
+from langgraph.prebuilt import create_react_agent
+import datetime
 
-router = APIRouter()
-
-# ── Schemas ───────────────────────────────────────────────────────────────────
-
-class Context(BaseModel):
-    current_datetime: str
-    events: list[Any]
-    timetable: dict[str, Any]
+# ----------------------------
+# Models
+# ----------------------------
 
 class ChatRequest(BaseModel):
-    message: str
-    context: Context
+    user_query: str
+    timetable_data: List[Dict[str, Any]]
+    assignment_quiz_data: List[Dict[str, Any]]
+
 
 class ChatResponse(BaseModel):
     response: str
+    source: str  # "timetable", "assignment_quiz", or "general"
 
 
-# ── Tools ─────────────────────────────────────────────────────────────────────
+# ----------------------------
+# LLM
+# ----------------------------
 
-@tool("get_timetable", description="Get the student's classes for a specific day or date.")
-def get_timetable(day: str) -> str:
-    """Args: day: Day name like 'Monday' or date like '2024-01-17'"""
-    return f"[Timetable lookup triggered for: {day}]"
-
-@tool("get_events", description="Get upcoming events or activities for a date or date range.")
-def get_events(date_range: str) -> str:
-    """Args: date_range: A date like '2024-01-17' or range like '2024-01-17 to 2024-01-20'"""
-    return f"[Events lookup triggered for: {date_range}]"
-
-@tool("check_free_time", description="Check if the student is free (no classes or events) on a given date.")
-def check_free_time(date: str) -> str:
-    """Args: date: Date in YYYY-MM-DD or relative like 'tomorrow', 'today', 'Monday'"""
-    return f"[Free-time check triggered for: {date}]"
-
-TOOLS = [get_timetable, get_events, check_free_time]
+model = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
 
 
-# ── System Prompt ─────────────────────────────────────────────────────────────
+# ----------------------------
+# Tools
+# ----------------------------
 
-SYSTEM_PROMPT_TEMPLATE = """
-You are the official Enaf Solutions University Assistant Chatbot.
-━━━━━━━━━━━━━━━━━━
-IDENTITY
-━━━━━━━━━━━━━━━━━━
-- Name: Enaf Solutions Chatbot
-- Developed by: Nabeel Babar, Ehtiram Ullah, and Afsar Ali
-- Your ONLY purpose is to help students with:
-  • Timetable
-  • Lecture schedule
-  • Events
-  • Free time availability
-  • Basic identity / greeting queries
-━━━━━━━━━━━━━━━━━━
-STUDENT CONTEXT
-━━━━━━━━━━━━━━━━━━
-{raw_context}
-━━━━━━━━━━━━━━━━━━
-YOU ARE ALLOWED TO:
-━━━━━━━━━━━━━━━━━━
-Answer questions related to:
-✔ Lecture timing  
-✔ Timetable  
-✔ Events  
-✔ Next class  
-✔ Free time  
-✔ Schedule management  
-✔ Greetings  
-✔ Identity (Who are you?)
-Examples:
-- Mera next lecture kab hai?
-- Do I have class tomorrow?
-- Kya Monday ko lecture hai?
-- Any event today?
-- Am I free on Friday?
-- Mera timetable kya hai?
-- Who are you?
-━━━━━━━━━━━━━━━━━━
-GREETING RULE
-━━━━━━━━━━━━━━━━━━
-If the user greets you (Hi, Hello, Salam, Assalamualaikum, etc.)
-Respond politely and briefly offer help regarding timetable or events.
-━━━━━━━━━━━━━━━━━━
-IDENTITY RULE
-━━━━━━━━━━━━━━━━━━
-If the user asks:
-- Who are you?
-- Tum kon ho?
-- Aap kya ho?
-Respond EXACTLY:
-"I am the Enaf Solutions chatbot developed by Nabeel Babar, Ehtiram Ullah, and Afsar Ali. I am here to help you manage your timetable and university events."
-Do NOT add anything else.
-━━━━━━━━━━━━━━━━━━
-STRICT LIMITATION
-━━━━━━━━━━━━━━━━━━
-You MUST NOT answer:
-✖ General knowledge  
-✖ Coding questions  
-✖ Math problems  
-✖ Weather  
-✖ News  
-✖ Food / Khana  
-✖ Personal advice  
-✖ Any topic unrelated to timetable or events  
-If the question is OUTSIDE timetable, lecture schedule,
-events, time management or basic identity/greeting,
-Respond politely with:
-"Sorry, I could not help you with that. I am developed by Enaf Solutions to assist students with timetable management and university events only."
-━━━━━━━━━━━━━━━━━━
-IMPORTANT RULES
-━━━━━━━━━━━━━━━━━━
-1. Always reply in the SAME language used by the user
-   (English / Urdu / Roman Urdu)
-2. Use tools when the user asks about:
-   - timetable
-   - lecture timing
-   - events
-   - free time
-3. NEVER make up timetable or event data.
-   Only use the Student Context provided above.
-4. Be concise and helpful.
-5. Do not provide explanations outside your domain.
-"""
+@tool
+def get_timetable(query: str, timetable_data: List[Dict[str, Any]]) -> str:
+    """
+    Get the student's class schedule.
+    Use this tool when the user asks about:
+    - Today's classes or any specific day's classes
+    - Next class, upcoming class, or current class
+    - Class timings, rooms, or subjects
 
+    Args:
+        query: The user's original question.
+        timetable_data: List of class entries with fields like day, subject, start_time, end_time, room.
+    """
+    now = datetime.datetime.now()
+    today = now.strftime("%A")
 
-# ── Agent ─────────────────────────────────────────────────────────────────────
-
-async def run_agent(message: str, context: Context) -> str:
-    raw_context = json.dumps(context.model_dump(), ensure_ascii=False, indent=2)
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(raw_context=raw_context)
-
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.2)
-    llm_with_tools = llm.bind_tools(TOOLS)
-
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=message),
+    # Filter today's classes
+    todays_classes = [
+        cls for cls in timetable_data
+        if cls.get("day", "").strip().capitalize() == today
     ]
 
-    response = await llm_with_tools.ainvoke(messages)
-    messages.append(response)
+    if not todays_classes:
+        return f"No classes found for today ({today})."
 
-    # Agentic loop — resolve all tool calls until LLM gives final answer
-    while response.tool_calls:
-        for tool_call in response.tool_calls:
-            matched_tool = next((t for t in TOOLS if t.name == tool_call["name"]), None)
-            tool_result = (
-                matched_tool.invoke(tool_call["args"])
-                if matched_tool
-                else f"Tool '{tool_call['name']}' not found."
+    # Sort by start_time
+    def parse_time(t: str):
+        for fmt in ("%H:%M", "%I:%M %p", "%I:%M%p"):
+            try:
+                return datetime.datetime.strptime(t, fmt)
+            except ValueError:
+                continue
+        return datetime.datetime.min
+
+    sorted_classes = sorted(todays_classes, key=lambda x: parse_time(x.get("start_time", "00:00")))
+
+    # Find next upcoming class
+    for cls in sorted_classes:
+        class_time = parse_time(cls.get("start_time", "00:00"))
+        if class_time.replace(year=now.year, month=now.month, day=now.day) > now:
+            return (
+                f"Your next class is **{cls.get('subject', 'Unknown')}** "
+                f"at {cls.get('start_time')} in room {cls.get('room', 'TBD')}."
             )
-            messages.append(ToolMessage(content=str(tool_result), tool_call_id=tool_call["id"]))
 
-        response = await llm_with_tools.ainvoke(messages)
-        messages.append(response)
+    # All classes done for the day
+    class_list = "\n".join(
+        f"- {c.get('subject')} at {c.get('start_time')} (Room: {c.get('room', 'TBD')})"
+        for c in sorted_classes
+    )
+    return f"All classes for today ({today}) are done. Today's schedule was:\n{class_list}"
 
-    return str(response.content)
+
+@tool
+def get_quiz_and_assignments(query: str, assignment_quiz_data: List[Dict[str, Any]]) -> str:
+    """
+    Get upcoming assignments and quizzes.
+    Use this tool when the user asks about:
+    - Upcoming assignments, quizzes, or tests
+    - Due dates or deadlines
+    - Pending tasks or submissions
+
+    Args:
+        query: The user's original question.
+        assignment_quiz_data: List of items with fields like type, title, due_date, subject, description.
+    """
+    if not assignment_quiz_data:
+        return "No upcoming assignments or quizzes found."
+
+    now = datetime.datetime.now().date()
+
+    # Filter only assignments and quizzes
+    relevant = [
+        item for item in assignment_quiz_data
+        if item.get("type", "").lower() in ["assignment", "quiz"]
+    ]
+
+    if not relevant:
+        return "No assignments or quizzes found in your data."
+
+    # Sort by due_date if available
+    def parse_date(d: str):
+        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y"):
+            try:
+                return datetime.datetime.strptime(d, fmt).date()
+            except (ValueError, TypeError):
+                continue
+        return datetime.date.max
+
+    sorted_items = sorted(relevant, key=lambda x: parse_date(x.get("due_date", "")))
+
+    lines = []
+    for item in sorted_items:
+        due = item.get("due_date", "Unknown date")
+        title = item.get("title", "Untitled")
+        subject = item.get("subject", "")
+        item_type = item.get("type", "Task").capitalize()
+
+        due_date = parse_date(due)
+        days_left = (due_date - now).days if due_date != datetime.date.max else None
+
+        urgency = ""
+        if days_left is not None:
+            if days_left < 0:
+                urgency = " *(overdue)*"
+            elif days_left == 0:
+                urgency = " *(due today!)*"
+            elif days_left == 1:
+                urgency = " *(due tomorrow)*"
+            else:
+                urgency = f" *({days_left} days left)*"
+
+        subject_str = f" [{subject}]" if subject else ""
+        lines.append(f"- **{item_type}**: {title}{subject_str} — Due: {due}{urgency}")
+
+    return "Upcoming assignments and quizzes:\n" + "\n".join(lines)
 
 
-# ── Route ─────────────────────────────────────────────────────────────────────
+# ----------------------------
+# System Prompt
+# ----------------------------
 
-@router.post("/api/chat", response_model=ChatResponse, status_code=200)
+SYSTEM_PROMPT = (
+    "NABEEL BABAR, EHTIRAM ULLAH, AFSAR ALI are your creators, that are the founder of ENAF SOLUTIONS."
+    "You are a smart and helpful academic assistant for students at UMT (University of Management and Technology). "
+    "You have access to the student's timetable and upcoming assignments/quizzes through tools. "
+    "When a student asks about their schedule, classes, or next class — use the get_timetable tool. "
+    "When a student asks about assignments, quizzes, deadlines, or pending tasks — use the get_quiz_and_assignments tool. "
+    "Always pass the full timetable_data or assignment_quiz_data from context into the tool. "
+    "Be concise, friendly, and accurate. If information is unavailable, say so clearly."
+)
+
+
+# ----------------------------
+# Agent (LangGraph ReAct)
+# ----------------------------
+
+agent = create_react_agent(
+    model=model,
+    tools=[get_timetable, get_quiz_and_assignments],
+    prompt=SYSTEM_PROMPT,
+)
+
+
+# ----------------------------
+# Router
+# ----------------------------
+
+router = APIRouter(prefix="/chat", tags=["Chatbot"])
+
+
+@router.post("/", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    if not request.message or not request.message.strip():
-        raise HTTPException(status_code=400, detail="Message cannot be empty.")
-
     try:
-        answer = await run_agent(request.message, request.context)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
+        # Build message with full context embedded
+        user_message = HumanMessage(
+            content=(
+                f"User query: {request.user_query}\n\n"
+                f"Timetable data: {request.timetable_data}\n\n"
+                f"Assignment/Quiz data: {request.assignment_quiz_data}"
+            )
+        )
 
-    return ChatResponse(response=answer)
+        # Invoke the ReAct agent
+        result = await agent.ainvoke({"messages": [user_message]})
+
+        # Extract final response text
+        final_message = result["messages"][-1]
+        response_text = final_message.content
+
+        # Determine which tool was used by inspecting message history
+        tool_names_used = [
+            msg.name
+            for msg in result["messages"]
+            if hasattr(msg, "name") and msg.name
+        ]
+
+        if "get_timetable" in tool_names_used:
+            source = "timetable"
+        elif "get_quiz_and_assignments" in tool_names_used:
+            source = "assignment_quiz"
+        else:
+            source = "general"
+
+        return ChatResponse(response=response_text, source=source)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
